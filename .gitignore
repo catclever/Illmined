@@ -1,0 +1,30 @@
+# Python Environments
+.venv/
+env/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDEs and OS Files
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Agent Data (Must not be synced)
+.agent/
+
+# Datasets
+data
+data/
+
+# Model Checkpoints and Large Outputs
+*.safetensors
+*.bin
+*.pt
+*.pkl
+*.npy
+weight_clustering/outputs/
+dynamic_sparsity/outputs/
