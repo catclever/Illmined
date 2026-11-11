@@ -13,8 +13,9 @@ __pycache__/
 .DS_Store
 *.swp
 
-# Agent Data (Must not be synced)
+# Agent & Local Sandbox Data (Must not be synced)
 .agent/
+dev_test/
 
 # Datasets
 data
@@ -26,5 +27,6 @@ data/
 *.pt
 *.pkl
 *.npy
+**/outputs/
 weight_clustering/outputs/
 dynamic_sparsity/outputs/
