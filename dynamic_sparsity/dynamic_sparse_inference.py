@@ -5,6 +5,19 @@ import time
 import pickle
 import argparse
 import sys
+"""
+dynamic_sparse_inference.py
+
+核心推理框架模块。
+包含稀疏化核心算法的定义：
+- StaticSparseLinear: 静态按权重大小进行稀疏化的线性层
+- PermutedSparseLinear: 处理矩阵重排（为了更好地分块）的包裹层
+- DynamicAbsoluteSparseLinear: 基于输入激活 (Activation) 与权重 (Weight) 动态计算注意力/重要性，
+  并利用 argsort 动态进行按需稀疏化的核心创新层。
+
+注意：由于 DynamicAbsoluteSparseLinear 在每次推理时都需要根据输入动态计算掩码并进行排序 (argsort)，
+如果直接在 Python/MLX 层面不加 custom kernel 运行，速度会相对较慢，但可用于验证算法正确性。
+"""
 import os
 
 class PermutedSparseLinear(nn.Module):
@@ -62,33 +75,105 @@ class DynamicAbsoluteSparseLinear(nn.Module):
         W_blocks = self.weight.reshape((self.N_out, self.B_out, self.N_in, self.B_in))
         self.W_norm = mx.sum(mx.abs(W_blocks), axis=(1, 3))
         
+        # Compile Custom Metal Kernel
+        source = f"""
+        uint D_in = {D_in};
+        uint N_in = {self.N_in};
+        uint B_in = {self.B_in};
+        uint B_out = {self.B_out};
+        float sparsity_ratio = {self.sparsity_ratio};
+        
+        uint out_idx = thread_position_in_grid.x;
+        uint block_out = out_idx / B_out;
+        uint local_id = thread_position_in_threadgroup.x; // 0 to 63
+        
+        // Parallel Bitonic Sort in Shared Memory (N=64)
+        threadgroup float shared_impacts[64];
+        
+        if (local_id < N_in) {{
+            shared_impacts[local_id] = w_norm[block_out * N_in + local_id] * x_norm[local_id];
+        }} else {{
+            shared_impacts[local_id] = -1e9;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        
+        // Bitonic Sort for 64 elements (21 steps)
+        for (uint k = 2; k <= 64; k *= 2) {{
+            for (uint j = k / 2; j > 0; j /= 2) {{
+                uint ixj = local_id ^ j;
+                if (ixj > local_id) {{
+                    if ((local_id & k) == 0) {{
+                        // Ascending
+                        if (shared_impacts[local_id] > shared_impacts[ixj]) {{
+                            float tmp = shared_impacts[local_id];
+                            shared_impacts[local_id] = shared_impacts[ixj];
+                            shared_impacts[ixj] = tmp;
+                        }}
+                    }} else {{
+                        // Descending
+                        if (shared_impacts[local_id] < shared_impacts[ixj]) {{
+                            float tmp = shared_impacts[local_id];
+                            shared_impacts[local_id] = shared_impacts[ixj];
+                            shared_impacts[ixj] = tmp;
+                        }}
+                    }}
+                }}
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }}
+        }}
+        
+        // Exact percentile threshold
+        uint threshold_idx = (uint)(sparsity_ratio * 64.0);
+        if (threshold_idx >= 64) threshold_idx = 63;
+        float threshold = shared_impacts[threshold_idx];
+        
+        float sum = 0.0;
+        for (uint block_in = 0; block_in < N_in; ++block_in) {{
+            float original_impact = w_norm[block_out * N_in + block_in] * x_norm[block_in];
+            if (original_impact >= threshold) {{
+                for (uint j = 0; j < B_in; ++j) {{
+                    uint in_idx = block_in * B_in + j;
+                    sum += static_cast<float>(x[in_idx]) * static_cast<float>(w[out_idx * D_in + in_idx]);
+                }}
+            }}
+        }}
+        out[out_idx] = static_cast<__typeof__(out[0])>(sum);
+        """
+        self.kernel = mx.fast.metal_kernel(
+            name=f"dynamic_sparse_gemm_{D_in}_{D_out}",
+            input_names=["x", "w", "w_norm", "x_norm"],
+            output_names=["out"],
+            source=source
+        )
+        
     def __call__(self, x):
         B, L, D_in = x.shape
         D_out, _ = self.weight.shape
         
-        x_blocks = x.reshape((B, L, self.N_in, self.B_in))
+        # Fallback to dense for prefill to avoid OOM or slow python loops
+        if L > 1 or B > 1:
+            return x @ self.weight.T
+            
+        x_blocks = x.reshape((self.N_in, self.B_in))
         x_norm = mx.sum(mx.abs(x_blocks), axis=-1)
         
-        Impact = self.W_norm.reshape((1, 1, self.N_out, self.N_in)) * x_norm.reshape((B, L, 1, self.N_in))
+        # Ensure all arrays are flat and contiguous before passing to Metal
+        x_flat = mx.reshape(x, (-1,))
+        w_flat = mx.reshape(self.weight, (-1,))
+        w_norm_flat = mx.reshape(self.W_norm, (-1,))
+        x_norm_flat = mx.reshape(x_norm, (-1,))
         
-        flat_impact = Impact.reshape((B, L, -1))
-        sorted_impact = mx.sort(flat_impact, axis=-1)
-        idx = int(self.sparsity_ratio * flat_impact.shape[-1])
-        idx = min(max(idx, 0), flat_impact.shape[-1] - 1)
-        threshold_val = sorted_impact[:, :, idx:idx+1]
-        
-        Mask = Impact > threshold_val.reshape((B, L, 1, 1))
-        
-        Mask_expanded = Mask.reshape((B, L, self.N_out, 1, self.N_in, 1))
-        Mask_expanded = mx.broadcast_to(Mask_expanded, (B, L, self.N_out, self.B_out, self.N_in, self.B_in))
-        Mask_expanded = Mask_expanded.reshape((B, L, D_out, D_in))
-        
-        x_expanded = x.reshape((B, L, 1, D_in))
-        W_expanded = self.weight.reshape((1, 1, D_out, D_in))
-        
-        masked_W = W_expanded * Mask_expanded
-        Z = mx.sum(x_expanded * masked_W, axis=-1)
-        return Z
+        # Run Custom Metal Kernel
+        outputs = self.kernel(
+            inputs=[x_flat, w_flat, w_norm_flat, x_norm_flat],
+            template=[],
+            grid=(D_out, 1, 1),
+            threadgroup=(self.B_out, 1, 1),
+            output_shapes=[(D_out,)],
+            output_dtypes=[x.dtype]
+        )
+        Z = outputs[0]
+        return Z.reshape((B, L, D_out))
 
 def generate_custom(model, tokenizer, prompt, prefill_sparse=False, decode_sparse=False, set_mode_func=None, max_tokens=50):
     prompt_tokens = mx.array([tokenizer.encode(prompt)])
